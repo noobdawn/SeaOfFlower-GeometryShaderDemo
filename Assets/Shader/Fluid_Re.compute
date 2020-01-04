@@ -1,0 +1,116 @@
+﻿#pragma kernel Advect
+#pragma kernel Jacobi1
+#pragma kernel Jacobi2
+#pragma kernel Force
+#pragma kernel Divergence
+#pragma kernel Subtract
+
+// Common arguments
+float dx, dt;
+
+// U (velocity field)
+Texture2D<float2> U_in;
+SamplerState samplerU_in;
+RWTexture2D<float2> U_out;
+
+// Jacobi method arguments
+float Alpha, Beta;
+
+Texture2D<float> X1_in;
+Texture2D<float> B1_in;
+RWTexture2D<float> X1_out;
+
+Texture2D<float2> X2_in; 
+Texture2D<float2> B2_in;
+RWTexture2D<float2> X2_out;
+
+// Force method arguments
+float4 ForceDirection;
+float4 ForcePosition;
+float ForceRadius;
+
+// Subtract method arguments
+Texture2D<float> P_in;
+SamplerState samplerP_in;
+RWTexture2D<float> P_out;
+
+[numthreads(8, 8, 1)]
+// 自对流，速度被速度场搬运
+void Advect(uint2 tid : SV_DispatchThreadID)
+{
+	uint2 dim;
+	U_out.GetDimensions(dim.x, dim.y);
+	// 找到格子中心
+	float2 uv = (tid + 0.5) / dim;
+	// 移动的距离：此处的速度场*时间步长，因为是用uv计算所以要考虑aspect
+	float2 duv = U_in[tid] * float2((float)dim.y / dim.x, 1) * dt;
+	
+	U_out[tid] = U_in.SampleLevel(samplerU_in, uv - duv, 0);
+}
+
+// Jacobi method with a scalar field
+[numthreads(8, 8, 1)]
+void Jacobi1(uint2 tid : SV_DispatchThreadID)
+{
+	X1_out[tid] = (X1_in[tid - int2(1, 0)] + X1_in[tid + int2(1, 0)] +
+		X1_in[tid - int2(0, 1)] + X1_in[tid + int2(0, 1)] + Alpha * B1_in[tid]) / Beta;
+}
+
+// Jacobi method with a vector field
+[numthreads(8, 8, 1)]
+void Jacobi2(uint2 tid : SV_DispatchThreadID)
+{
+	X2_out[tid] = (X2_in[tid - int2(1, 0)] + X2_in[tid + int2(1, 0)] +
+		X2_in[tid - int2(0, 1)] + X2_in[tid + int2(0, 1)] + Alpha * B2_in[tid]) / Beta;
+}
+
+
+[numthreads(8, 8, 1)]
+void Force(uint2 tid : SV_DispatchThreadID)
+{
+	if (ForceDirection.w == 0) return;
+	uint2 dim;
+	U_out.GetDimensions(dim.x, dim.y);
+	// 计算c值
+	float2 pos = (tid + 0.5 - dim * 0.5) / dim.y;
+	// pos.x in [-0.5 * aspect, 0.5 * aspect]
+	// pos.y in [-0.5, 0.5]
+	float strength = ForceDirection.w * (1 - saturate(distance(ForcePosition.xy, pos) / ForceRadius));
+		//ForceDirection.w * exp(distance(ForcePosition.xy, pos) / ForceRadius);       ----keijiro
+		//exp(-ForceDirection.w * distance(ForcePosition.xy, pos));                    --- GPU Gems 1
+
+	U_out[tid] = U_in[tid] + strength * ForceDirection.xy;
+}
+
+[numthreads(8, 8, 1)]
+void Divergence(uint2 tid : SV_DispatchThreadID)
+{
+	uint2 dim;
+	U_out.GetDimensions(dim.x, dim.y);
+	U_out[tid] = (U_in[tid + int2(1, 0)].x - U_in[tid - int2(1, 0)].x +
+		U_in[tid + int2(0, 1)].y - U_in[tid - int2(0, 1)].y) * 0.5 * dim.y;
+	P_out[tid] = 0;
+}
+
+[numthreads(8, 8, 1)]
+void Subtract(uint2 tid : SV_DispatchThreadID)
+{
+	// 包含边界条件
+	uint2 dim;
+	U_out.GetDimensions(dim.x, dim.y);
+	if (any(tid == 0) || any(tid == dim - 1)) return;
+
+	float P1 = P_in[max(tid - int2(1, 0), 1)];
+	float P2 = P_in[min(tid + int2(1, 0), dim - 2)];
+	float P3 = P_in[max(tid - int2(0, 1), 1)];
+	float P4 = P_in[min(tid + int2(0, 1), dim - 2)];
+	float2 u = U_in[tid] - float2(P2 - P1, P4 - P3) * dim.y * 0.5;
+
+	U_out[tid] = u;
+	
+	// 为了保证边界处的法线分量为0，将边界处的速度反转
+	if (tid.x == 1) U_out[int2(0, tid.y)] = -u;
+	if (tid.y == 1) U_out[int2(tid.x, 0)] = -u;
+	if (tid.x == dim.x - 2) U_out[int2(dim.x - 1, tid.y)] = -u;
+	if (tid.y == dim.y - 2) U_out[int2(tid.x, dim.y - 1)] = -u;
+}
